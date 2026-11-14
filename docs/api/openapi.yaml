@@ -1,0 +1,587 @@
+openapi: 3.0.3
+info:
+  title: ARKOD Premier League Analytics API
+  version: 1.0.0
+  description: |
+    HTTP API сервиса аналитики матчей Английской премьер-лиги.
+    Job выполняет сравнение исторической статистики команд или расчёт
+    статистических вероятностей исходов выбранного матча.
+    Прогноз является оценкой вероятностей и не гарантирует результат матча.
+
+    Все операции с Job доступны только её владельцу, определяемому по
+    проверенному Bearer JWT. Для чужой и несуществующей Job возвращается
+    одинаковый 404 NOT_FOUND. Максимальный размер JSON-тела запроса — 65536
+    байт (64 KiB); лимит проверяется на HTTP-границе до разбора JSON.
+servers:
+  - url: /api/v1
+    description: API v1
+tags:
+  - name: Matches
+  - name: Jobs
+security:
+  - bearerAuth: []
+paths:
+  /matches:
+    get:
+      tags: [Matches]
+      operationId: listMatches
+      summary: Список матчей АПЛ
+      description: |
+        Возвращает матчи из локального кэша расписания. Параметры фильтра
+        можно комбинировать. Результат постраничный; порядок — по дате начала
+        матча по возрастанию. Если переданы обе даты, date_from должна быть
+        меньше или равна date_to; иначе возвращается 422 VALIDATION_ERROR
+        с указанием date_from/date_to. Если кэш доступен, он возвращается
+        даже при недоступности внешнего источника; last_updated показывает
+        время обновления данных. Если кэш отсутствует и источник недоступен,
+        возвращается 503 SERVICE_UNAVAILABLE.
+      parameters:
+        - name: date_from
+          in: query
+          description: Начало диапазона дат включительно (UTC). Не позже date_to.
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          description: Конец диапазона дат включительно (UTC). Не раньше date_from.
+          schema: { type: string, format: date }
+        - name: status
+          in: query
+          description: Статус матча у источника.
+          schema:
+            type: string
+            enum: [SCHEDULED, TIMED, IN_PLAY, PAUSED, FINISHED, POSTPONED, SUSPENDED, CANCELLED]
+        - name: team_id
+          in: query
+          description: ID команды в источнике football-data.org.
+          schema: { type: integer, minimum: 1 }
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Страница матчей.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MatchPage'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs:
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: Создать задачу анализа матча
+      description: |
+        Создаёт асинхронную Job. Область уникальности Idempotency-Key —
+        владелец, определённый по проверенному Bearer JWT. Запись ключа и
+        создание Job выполняются атомарно в одной транзакции PostgreSQL;
+        на паре (owner_id, Idempotency-Key) действует UNIQUE-ограничение.
+        При конкурентном конфликте сервер читает существующую запись и
+        сравнивает хеш нормализованного тела: одинаковый хеш возвращает ту
+        же Job с тем же id и тем же телом ответа; другой хеш возвращает
+        409 IDEMPOTENCY_KEY_REUSED. Ключ и связь с Job переживают перезапуск.
+        Новый ключ создаёт новую Job; отдельной операции повторного запуска
+        существующей Job нет. Внешний источник не вызывается синхронно при
+        создании: 503 здесь означает недоступность хранилища/самого API,
+        а ошибки внешнего источника обрабатываются уже исполнителем Job.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateJobRequest'}
+            examples:
+              compare:
+                value:
+                  operation: compare_teams
+                  match_id: 123456
+              predict:
+                value:
+                  operation: predict_outcome
+                  match_id: 123456
+      responses:
+        '202':
+          description: Job принята в очередь либо существующая Job атомарно найдена по ключу идемпотентности. При повторе возвращаются тот же id и тот же ресурс.
+          headers:
+            Location:
+              description: URL созданной Job.
+              schema: { type: string, format: uri-reference }
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Ключ идемпотентности уже использован с другим телом.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+              examples:
+                keyConflict:
+                  value:
+                    error:
+                      code: IDEMPOTENCY_KEY_REUSED
+                      message: Idempotency-Key уже использован с другими параметрами.
+                      details:
+                        - field: Idempotency-Key
+                          message: Используйте новый ключ для другого запроса.
+                      request_id: req-01JABC
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: Хранилище Job/ключей идемпотентности временно недоступно; Job не создана.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+              example:
+                error:
+                  code: SERVICE_UNAVAILABLE
+                  message: Хранилище задач временно недоступно.
+                  details:
+                    - field: storage
+                      message: Повторите запрос позже; Job не создана.
+                  request_id: req-01JABC
+
+  /jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Получить состояние Job
+      description: Возвращает Job только её владельцу. Чужой и несуществующий id дают одинаковый 404 NOT_FOUND.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Текущее состояние и метаданные Job.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{job_id}/result:
+    get:
+      tags: [Jobs]
+      operationId: getJobResult
+      summary: Получить результат Job
+      description: |
+        Результат доступен только для Job в состоянии done и только её владельцу.
+        Для created, running и waiting_quota возвращается 409 RESULT_NOT_READY.
+        Для failed и cancelled возвращается 409 RESULT_UNAVAILABLE. Чужой и
+        несуществующий id дают одинаковый 404 NOT_FOUND.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Сохранённый результат анализа.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobResult'}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Job ещё не завершена или результат недоступен.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+              examples:
+                notReady:
+                  value:
+                    error:
+                      code: RESULT_NOT_READY
+                      message: Задача ещё выполняется.
+                      details:
+                        - field: job_id
+                          message: Повторите запрос после перехода Job в состояние done.
+                      request_id: req-01JABC
+                unavailable:
+                  value:
+                    error:
+                      code: RESULT_UNAVAILABLE
+                      message: Для этой задачи результат не сохранён.
+                      details:
+                        - field: status
+                          message: Job завершилась в состоянии failed или cancelled.
+                      request_id: req-01JABC
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{job_id}/cancel:
+    post:
+      tags: [Jobs]
+      operationId: cancelJob
+      summary: Отменить незавершённую Job
+      description: |
+        Отмена поддерживается для created, running и waiting_quota и доступна
+        только владельцу Job. Для running используется кооперативная отмена:
+        исполнитель прекращает работу на ближайшей безопасной точке; уже
+        выполненная часть работы не публикуется как результат, частичный
+        результат не доступен через /result. Проверка отмены выполняется перед
+        публикацией результата, поэтому отменённая Job не может перейти в done.
+        Успешная отмена переводит Job в cancelled. Повторная отмена cancelled
+        возвращает текущую Job (200); отмена done или failed возвращает 409.
+        Чужой и несуществующий id дают одинаковый 404 NOT_FOUND.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job отменена либо уже находится в cancelled.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Job уже находится в конечном состоянии done или failed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+              example:
+                error:
+                  code: JOB_NOT_CANCELLABLE
+                  message: Нельзя отменить завершённую задачу.
+                  details:
+                    - field: status
+                      message: Отмена разрешена только для created, running или waiting_quota.
+                  request_id: req-01JABC
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Идентификатор владельца Job извлекается из проверенного токена.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный ключ создания Job в области владельца (owner_id из Bearer JWT); рекомендуется UUID. Один ключ с тем же телом возвращает прежнюю Job, с другим телом — 409.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    CreateJobRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, match_id]
+      properties:
+        operation:
+          type: string
+          enum: [compare_teams, predict_outcome]
+          description: Тип анализа.
+        match_id:
+          type: integer
+          minimum: 1
+          description: ID матча из каталога GET /matches.
+    Job:
+      description: |
+        Ресурс задачи. Терминальные состояния: done, failed, cancelled;
+        переходов из них нет. Новое выполнение после терминального состояния
+        создаётся отдельным POST /jobs с новым Idempotency-Key. При аварийном
+        перезапуске Job, оставшаяся в running без активного исполнителя,
+        переводится recovery-процедурой в failed с error.code=WORKER_INTERRUPTED;
+        автоматического повтора нет.
+      type: object
+      required: [id, operation, match_id, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        operation:
+          type: string
+          enum: [compare_teams, predict_outcome]
+        match_id:
+          type: integer
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        error:
+          allOf:
+            - $ref: '#/components/schemas/ErrorObject'
+          nullable: true
+          description: Для прерванной аварией задачи code=WORKER_INTERRUPTED; для остальных ошибок код определяет причину завершения.
+    JobStatus:
+      type: string
+      description: |
+        Разрешённые переходы: created→running/cancelled; running→done/failed/
+        waiting_quota/cancelled; waiting_quota→running/failed/cancelled.
+        done, failed и cancelled — терминальные состояния. Тайм-ауты и
+        временные 5xx внешнего источника повторяются ограниченное число раз
+        внутри running. Ответ 429 переводит Job в waiting_quota. Повторный
+        запрос выполняется после Retry-After, а если заголовка нет — через
+        60 секунд; исполнитель на время ожидания освобождается. После
+        конфигурируемого максимального срока ожидания Job переходит в failed.
+      enum: [created, running, waiting_quota, done, failed, cancelled]
+    MatchPage:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Match'}
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
+    Match:
+      type: object
+      required: [id, utc_date, status, home_team, away_team]
+      properties:
+        id: { type: integer }
+        utc_date: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [SCHEDULED, TIMED, IN_PLAY, PAUSED, FINISHED, POSTPONED, SUSPENDED, CANCELLED]
+        matchday: { type: integer, nullable: true }
+        home_team: {$ref: '#/components/schemas/Team'}
+        away_team: {$ref: '#/components/schemas/Team'}
+        score:
+          type: object
+          nullable: true
+          properties:
+            home: { type: integer, nullable: true }
+            away: { type: integer, nullable: true }
+        last_updated:
+          type: string
+          format: date-time
+          nullable: true
+    Team:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        short_name: { type: string, nullable: true }
+    JobResult:
+      type: object
+      required: [job_id, operation, match_id, generated_at, data, disclaimer]
+      properties:
+        job_id: { type: string, format: uuid }
+        operation:
+          type: string
+          enum: [compare_teams, predict_outcome]
+        match_id: { type: integer }
+        generated_at: { type: string, format: date-time }
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/ComparisonResult'
+            - $ref: '#/components/schemas/PredictionResult'
+        disclaimer:
+          type: string
+          example: Вероятности являются статистической оценкой и не гарантируют исход матча.
+    ComparisonResult:
+      type: object
+      required: [home_team, away_team, metrics]
+      properties:
+        home_team: { type: string }
+        away_team: { type: string }
+        sample_size:
+          type: integer
+          minimum: 0
+        metrics:
+          type: array
+          items:
+            type: object
+            required: [name, home_value, away_value]
+            properties:
+              name: { type: string }
+              home_value: { type: number }
+              away_value: { type: number }
+              unit: { type: string, nullable: true }
+    PredictionResult:
+      type: object
+      required: [home_win, draw, away_win, method]
+      properties:
+        home_win: { type: number, minimum: 0, maximum: 1 }
+        draw: { type: number, minimum: 0, maximum: 1 }
+        away_win: { type: number, minimum: 0, maximum: 1 }
+        method:
+          type: string
+          description: Идентификатор версии статистического метода.
+        sample_size:
+          type: integer
+          minimum: 0
+        explanation:
+          type: string
+          nullable: true
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorObject'
+    ErrorObject:
+      description: Единый объект ошибки. Известный код аварийного восстановления Job — WORKER_INTERRUPTED.
+      type: object
+      required: [code, message, details, request_id]
+      properties:
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message: { type: string }
+        details:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+                description: Имя поля, параметра или заголовка; для общей ошибки — request.
+              message: { type: string }
+        request_id: { type: string }
+    Empty:
+      type: object
+      additionalProperties: false
+  responses:
+    BadRequest:
+      description: Некорректный синтаксис запроса.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: BAD_REQUEST
+              message: Некорректный запрос.
+              details:
+                - field: request
+                  message: Проверьте синтаксис HTTP-запроса.
+              request_id: req-01JABC
+    Unauthorized:
+      description: Отсутствует или недействителен токен.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: Требуется аутентификация.
+              details:
+                - field: Authorization
+                  message: Передайте действительный Bearer-токен.
+              request_id: req-01JABC
+    NotFound:
+      description: Job не существует или недоступна текущему пользователю.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: NOT_FOUND
+              message: Задача не найдена.
+              details:
+                - field: job_id
+                  message: Задача не существует или недоступна.
+              request_id: req-01JABC
+    ValidationError:
+      description: Параметры не прошли валидацию.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Некорректные параметры запроса.
+              details:
+                - field: match_id
+                  message: Поле обязательно и должно быть положительным целым числом.
+              request_id: req-01JABC
+    PayloadTooLarge:
+      description: Размер тела запроса превышает лимит 64 KiB.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: PAYLOAD_TOO_LARGE
+              message: Тело запроса слишком большое.
+              details:
+                - field: request.body
+                  message: Максимальный размер тела — 65536 байт.
+              request_id: req-01JABC
+    ServiceUnavailable:
+      description: |
+        Временная недоступность хранилища/сервиса API либо отсутствие
+        локального кэша при недоступном внешнем источнике. Ошибки внешнего
+        источника во время исполнения Job не возвращаются этим ответом
+        создания: они отражаются состоянием Job.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: SERVICE_UNAVAILABLE
+              message: Сервис или данные расписания временно недоступны.
+              details:
+                - field: service
+                  message: Повторите запрос позже; для GET /matches проверьте доступность кэша.
+              request_id: req-01JABC
+    InternalError:
+      description: Непредвиденная внутренняя ошибка.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Внутренняя ошибка сервера.
+              details:
+                - field: request
+                  message: Передайте request_id службе поддержки.
+              request_id: req-01JABC
