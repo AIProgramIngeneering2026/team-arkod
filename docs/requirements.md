@@ -205,19 +205,31 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> created
-    created --> running
-    running --> waiting_quota: 429
+    [*] --> created: POST /jobs
+
+    created --> running: Dispatcher взял задачу
+    created --> cancelled: отмена пользователем
+
+    running --> waiting_quota: источник вернул 429
+    running --> done: результат сохранён
+    running --> failed: ошибка
+    running --> cancelled: отмена пользователем
+
     waiting_quota --> running: лимит сброшен
-    running --> done
-    running --> failed
-    waiting_quota --> failed: превышен предел ожидания
-    created --> cancelled
-    running --> cancelled
-    waiting_quota --> cancelled
-    done --> [*]
-    failed --> [*]
-    cancelled --> [*]
+    waiting_quota --> failed: превышен максимальный срок ожидания квоты
+    waiting_quota --> cancelled: отмена пользователем
+
+    note right of running
+        Отмена: остановка на ближайшей
+        безопасной точке, частичный
+        результат не публикуется.
+    end note
+
+    note right of waiting_quota
+        Есть Retry-After: ждём его.
+        Нет заголовка: ждём 60 с.
+        Исполнитель задачей не занят.
+    end note
 ```
 
 Состояния:
@@ -239,6 +251,20 @@ stateDiagram-v2
 - `running → failed` — обнаружена ошибка выполнения;
 - `waiting_quota → failed` — превышен предел ожидания лимита;
 - `created`, `running`, `waiting_quota` → `cancelled` — пользователь отменил задачу.
+
+Запрещённые переходы
+
+Разрешены только переходы со схемы. Всё остальное отклоняется без изменения данных.
+
+| Попытка | Реакция системы |
+|---|---|
+| Из `done`, `failed`, `cancelled` в любое другое состояние | `InvalidTransition`, данные не меняются. Отмена через API: `409 job_already_finished` |
+| `created → done`, `created → failed`, `created → waiting_quota` | `InvalidTransition`: сначала нужен `running` |
+| `waiting_quota → done` | `InvalidTransition`: сначала возврат в `running` |
+| Любой переход обратно в `created` | `InvalidTransition`: `created` бывает только при создании |
+| Повторное `created → running` вторым исполнителем | Условный `UPDATE ... WHERE status='created'` затронул 0 строк, второй исполнитель отступает |
+
+Повторный запуск после `failed` или `cancelled` переходом не является: создаётся новая Job с новым ключом идемпотентности, старая Job и причина её ошибки сохраняются.
 
 Все остальные переходы отклоняются без изменения данных. `done`, `failed` и `cancelled` — конечные состояния. Повторный анализ создаёт новую Job. Начать или возобновить выполнение одной Job может только один исполнитель. Конечное состояние и результат либо причина ошибки сохраняются атомарно. Отмена в `running` выполняется кооперативно: исполнитель проверяет запрос отмены перед каждым обращением к источнику и перед сохранением результата. Повторные попытки при тайм-аутах и `5xx` выполняются внутри `running`, ожидание лимита — в `waiting_quota`. Ошибки загрузки списка и валидации до создания задачи не являются состояниями Job.
 
