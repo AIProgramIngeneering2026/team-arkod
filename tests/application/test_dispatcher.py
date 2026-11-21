@@ -9,13 +9,20 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from arkod.application.dispatcher import (
-    Dispatcher, JobNotCancellable, ResultNotReady, ResultUnavailable, UnknownOperation,
+    Dispatcher,
+    JobNotCancellable,
+    ResultNotReady,
+    ResultUnavailable,
+    UnknownOperation,
 )
 from arkod.application.ports import (
-    IdempotencyConflict, JobNotFound, SnapshotError, StorageError,
+    IdempotencyConflict,
+    JobNotFound,
+    SnapshotError,
+    StorageError,
 )
 from arkod.domain.job import State
-from arkod.domain.tool import ToolError, ToolResult
+from arkod.domain.tools.models import ToolError, ToolResult
 from arkod.infrastructure.memory_job_repository import MemoryJobRepository
 
 
@@ -32,7 +39,10 @@ class FakeTool:
     def __init__(self):
         self.calls = []
         self.action = lambda params, snapshot, context: ToolResult(
-            "ok", {"matches": 20}, None, {"tool": self.name, "version": self.version},
+            "ok",
+            {"matches": 20},
+            None,
+            {"tool": self.name, "version": self.version},
         )
 
     def run(self, params, snapshot, context):
@@ -74,22 +84,40 @@ class Clock:
 
 @pytest.fixture
 def env():
-    repository, tool, data, clock = MemoryJobRepository(), FakeTool(), FakeDataService(), Clock()
+    repository, tool, data, clock = (
+        MemoryJobRepository(),
+        FakeTool(),
+        FakeDataService(),
+        Clock(),
+    )
     registry = StubRegistry({tool.name: tool})
-    dispatcher = Dispatcher(repository, registry, data, clock=clock, max_quota_wait_seconds=120)
+    dispatcher = Dispatcher(
+        repository, registry, data, clock=clock, max_quota_wait_seconds=120
+    )
     return dispatcher, repository, tool, data, clock, registry
 
 
-def create(dispatcher, *, match_id=1, key="request-00000001", owner="user-a", operation="compare_teams"):
+def create(
+    dispatcher,
+    *,
+    match_id=1,
+    key="request-00000001",
+    owner="user-a",
+    operation="compare_teams",
+):
     return dispatcher.create(
-        operation, {"match_id": match_id}, owner_id=owner,
-        idempotency_key=key, correlation_id="request-log-id",
+        operation,
+        {"match_id": match_id},
+        owner_id=owner,
+        idempotency_key=key,
+        correlation_id="request-log-id",
     )
 
 
 def throw(error):
     def action(*args):
         raise error
+
     return action
 
 
@@ -157,11 +185,19 @@ def test_create_is_separate_from_execution_and_passes_contract(env):
     assert len(tool.calls) == 1
 
 
-@pytest.mark.parametrize("params", [{}, {"match_id": 0}, {"match_id": "1"}, {"match_id": 1, "extra": 1}])
+@pytest.mark.parametrize(
+    "params", [{}, {"match_id": 0}, {"match_id": "1"}, {"match_id": 1, "extra": 1}]
+)
 def test_invalid_params_do_not_create_job(env, params):
     dispatcher, repository, *_ = env
     with pytest.raises(ValidationError):
-        dispatcher.create("compare_teams", params, owner_id="u", idempotency_key="k", correlation_id="c")
+        dispatcher.create(
+            "compare_teams",
+            params,
+            owner_id="u",
+            idempotency_key="k",
+            correlation_id="c",
+        )
     assert repository.pending_ids() == []
 
 
@@ -197,17 +233,25 @@ def test_new_tool_requires_only_registration(env):
 
         def run(self, params, snapshot, context):
             assert snapshot is data.snapshot
-            return ToolResult("ok", {"team": params.team, "count": params.count}, None, {})
+            return ToolResult(
+                "ok", {"team": params.team, "count": params.count}, None, {}
+            )
 
     tool = NewTool()
     registry.tools[tool.name] = tool
     job = dispatcher.create(
-        "unseen_operation", {"team": "Arsenal"}, owner_id="user-a",
-        idempotency_key="request-00000001", correlation_id="new-tool",
+        "unseen_operation",
+        {"team": "Arsenal"},
+        owner_id="user-a",
+        idempotency_key="request-00000001",
+        correlation_id="new-tool",
     )
     assert repository.get(job.id).job.params == {"team": "Arsenal", "count": 5}
     dispatcher.execute(job.id)
-    assert dispatcher.get_result(job.id, owner_id="user-a").data == {"team": "Arsenal", "count": 5}
+    assert dispatcher.get_result(job.id, owner_id="user-a").data == {
+        "team": "Arsenal",
+        "count": 5,
+    }
 
 
 def test_idempotency_owner_scope_conflict_and_new_key(env):
@@ -266,12 +310,20 @@ def test_result_availability_and_repeat_cancel(env):
     assert not dispatcher.execute(job.id)
 
 
-@pytest.mark.parametrize("status,expected", [("ok", State.DONE), ("error", State.FAILED), ("cancelled", State.CANCELLED)])
+@pytest.mark.parametrize(
+    "status,expected",
+    [("ok", State.DONE), ("error", State.FAILED), ("cancelled", State.CANCELLED)],
+)
 def test_tool_results(env, status, expected):
     dispatcher, repository, tool, *_ = env
     tool.action = lambda *args: ToolResult(
-        status, {"ok": True} if status == "ok" else None,
-        None if status == "ok" else ToolError("CANCELLED" if status == "cancelled" else "NOT_ENOUGH_DATA", "Причина"),
+        status,
+        {"ok": True} if status == "ok" else None,
+        None
+        if status == "ok"
+        else ToolError(
+            "CANCELLED" if status == "cancelled" else "NOT_ENOUGH_DATA", "Причина"
+        ),
         {},
     )
     job = create(dispatcher)
@@ -300,7 +352,15 @@ def test_unhandled_errors_become_internal_error(env, stage):
     assert "Секретные" not in saved.error_message
 
 
-@pytest.mark.parametrize("result", [None, ToolResult("ok", None, None, {}), ToolResult("error", {}, None, {}), ToolResult("rate_limited", None, None, {})])
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        ToolResult("ok", None, None, {}),
+        ToolResult("error", {}, None, {}),
+        ToolResult("rate_limited", None, None, {}),
+    ],
+)
 def test_invalid_tool_result_is_failed(env, result):
     dispatcher, repository, tool, *_ = env
     tool.action = lambda *args: result
@@ -309,7 +369,9 @@ def test_invalid_tool_result_is_failed(env, result):
     assert repository.get(job.id).job.error_code == "INTERNAL_ERROR"
 
 
-@pytest.mark.parametrize("code", ["MATCH_NOT_FOUND", "SOURCE_UNAVAILABLE", "SOURCE_BAD_DATA"])
+@pytest.mark.parametrize(
+    "code", ["MATCH_NOT_FOUND", "SOURCE_UNAVAILABLE", "SOURCE_BAD_DATA"]
+)
 def test_snapshot_error_does_not_call_tool(env, code):
     dispatcher, repository, tool, data, *_ = env
     data.action = throw(SnapshotError(code, "Данные недоступны"))
@@ -322,7 +384,9 @@ def test_snapshot_error_does_not_call_tool(env, code):
 
 def test_snapshot_error_raised_by_tool_is_internal_error(env):
     dispatcher, repository, tool, *_ = env
-    tool.action = throw(SnapshotError("SOURCE_RATE_LIMITED", "Это исключение не от сервиса данных", 42))
+    tool.action = throw(
+        SnapshotError("SOURCE_RATE_LIMITED", "Это исключение не от сервиса данных", 42)
+    )
     job = create(dispatcher)
     dispatcher.execute(job.id)
     assert repository.get(job.id).job.error_code == "INTERNAL_ERROR"
@@ -350,7 +414,10 @@ def test_quota_resume_not_early_and_keeps_same_job(env, delay, seconds):
 
 def test_waiting_quota_does_not_block_other_jobs(env):
     dispatcher, repository, tool, data, *_ = env
-    first, second = create(dispatcher), create(dispatcher, key="request-00000002", match_id=2)
+    first, second = (
+        create(dispatcher),
+        create(dispatcher, key="request-00000002", match_id=2),
+    )
 
     def prepare(operation, params, context):
         if params.match_id == 1:
@@ -370,7 +437,9 @@ def test_cumulative_wait_limit_and_restart_preserve_schedule(env):
     data.action = throw(SnapshotError("SOURCE_RATE_LIMITED", "Квота", 42))
     dispatcher.execute(job.id)
     # Новый экземпляр использует только сохранённые поля, без таймеров в памяти.
-    dispatcher = Dispatcher(repository, registry, data, clock=clock, max_quota_wait_seconds=120)
+    dispatcher = Dispatcher(
+        repository, registry, data, clock=clock, max_quota_wait_seconds=120
+    )
     assert dispatcher.recover() == 0
     assert not dispatcher.execute(job.id)
     clock.advance(42)
@@ -521,10 +590,16 @@ def test_failed_publication_does_not_persist_done_without_result(env):
     assert dispatcher.run_once() == 0
 
 
-@pytest.mark.parametrize("status,state", [("error", State.FAILED), ("cancelled", State.CANCELLED)])
-def test_failed_and_cancelled_tool_results_are_retried_without_execution(env, status, state):
+@pytest.mark.parametrize(
+    "status,state", [("error", State.FAILED), ("cancelled", State.CANCELLED)]
+)
+def test_failed_and_cancelled_tool_results_are_retried_without_execution(
+    env, status, state
+):
     dispatcher, repository, tool, data, *_ = env
-    tool.action = lambda *args: ToolResult(status, None, ToolError("REASON", "Причина"), {})
+    tool.action = lambda *args: ToolResult(
+        status, None, ToolError("REASON", "Причина"), {}
+    )
     job = create(dispatcher)
     fail_writes(repository, state)
     with pytest.raises(StorageError):
@@ -536,14 +611,21 @@ def test_failed_and_cancelled_tool_results_are_retried_without_execution(env, st
     assert len(tool.calls) == len(data.calls) == 1
 
 
-@pytest.mark.parametrize("kind,state", [
-    ("ok", State.DONE), ("error", State.FAILED), ("quota", State.WAITING_QUOTA),
-])
+@pytest.mark.parametrize(
+    "kind,state",
+    [
+        ("ok", State.DONE),
+        ("error", State.FAILED),
+        ("quota", State.WAITING_QUOTA),
+    ],
+)
 def test_cancel_discards_pending_transition(env, kind, state):
     dispatcher, repository, tool, data, *_ = env
     job = create(dispatcher)
     if kind == "error":
-        tool.action = lambda *args: ToolResult("error", None, ToolError("REASON", "Причина"), {})
+        tool.action = lambda *args: ToolResult(
+            "error", None, ToolError("REASON", "Причина"), {}
+        )
     elif kind == "quota":
         data.action = throw(SnapshotError("SOURCE_RATE_LIMITED", "Квота", 42))
     fail_writes(repository, state)
@@ -617,7 +699,9 @@ def test_one_storage_failure_does_not_block_other_jobs(env):
 
 
 @pytest.mark.parametrize("resume", [False, True])
-def test_rolled_back_claim_can_be_taken_again_without_duplicate_calculation(env, resume):
+def test_rolled_back_claim_can_be_taken_again_without_duplicate_calculation(
+    env, resume
+):
     dispatcher, repository, tool, data, clock, _ = env
     job = create(dispatcher)
     if resume:
@@ -628,7 +712,9 @@ def test_rolled_back_claim_can_be_taken_again_without_duplicate_calculation(env,
     fail_writes(repository, State.RUNNING)
     with pytest.raises(StorageError):
         dispatcher.execute(job.id)
-    assert repository.get(job.id).job.state == (State.WAITING_QUOTA if resume else State.CREATED)
+    assert repository.get(job.id).job.state == (
+        State.WAITING_QUOTA if resume else State.CREATED
+    )
     assert not tool.calls
     dispatcher.run_once()
     assert repository.get(job.id).job.state == State.DONE

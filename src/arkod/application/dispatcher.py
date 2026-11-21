@@ -9,11 +9,17 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from arkod.application.ports import (
-    DispatcherError, FootballDataService, JobNotFound, JobRecord,
-    JobRepository, Registry, SnapshotError, StorageError,
+    DispatcherError,
+    FootballDataService,
+    JobNotFound,
+    JobRecord,
+    JobRepository,
+    Registry,
+    SnapshotError,
+    StorageError,
 )
 from arkod.domain.job import Job, State
-from arkod.domain.tool import Tool, ToolContext, ToolError, ToolResult
+from arkod.domain.tools.models import Tool, ToolContext, ToolError, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +51,12 @@ class _PendingTransition:
 
 class Dispatcher:
     def __init__(
-        self, repository: JobRepository, registry: Registry,
-        data_service: FootballDataService, *, max_quota_wait_seconds: float = 300,
+        self,
+        repository: JobRepository,
+        registry: Registry,
+        data_service: FootballDataService,
+        *,
+        max_quota_wait_seconds: float = 300,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         if not math.isfinite(max_quota_wait_seconds) or max_quota_wait_seconds <= 0:
@@ -66,8 +76,13 @@ class Dispatcher:
             raise UnknownOperation(f"Неизвестная операция: {operation}") from exc
 
     def create(
-        self, operation: str, params: dict[str, Any], *, owner_id: str,
-        idempotency_key: str, correlation_id: str,
+        self,
+        operation: str,
+        params: dict[str, Any],
+        *,
+        owner_id: str,
+        idempotency_key: str,
+        correlation_id: str,
     ) -> Job:
         """Проверяет параметры и сохраняет created; расчёт здесь не запускается."""
         tool = self._tool(operation)
@@ -75,8 +90,10 @@ class Dispatcher:
         if not owner_id or not idempotency_key:
             raise ValueError("Требуются владелец и ключ идемпотентности")
         return self._repository.create_or_get(
-            owner_id=owner_id, idempotency_key=idempotency_key,
-            operation=operation, params=validated.model_dump(mode="json"),
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            operation=operation,
+            params=validated.model_dump(mode="json"),
             correlation_id=correlation_id,
         ).job
 
@@ -157,7 +174,8 @@ class Dispatcher:
         correlation_id = record.correlation_id
 
         context = ToolContext(
-            job_id, correlation_id,
+            job_id,
+            correlation_id,
             lambda: self._repository.get(job_id).job.is_cancelled,
         )
         try:
@@ -192,10 +210,17 @@ class Dispatcher:
     @staticmethod
     def _storage_failure(job_id: int, execution_id: str) -> _PendingTransition:
         return _PendingTransition(
-            job_id, execution_id,
-            ToolResult("error", None, ToolError(
-                "SERVICE_UNAVAILABLE", "Выполнение прервано сбоем хранилища",
-            ), {}),
+            job_id,
+            execution_id,
+            ToolResult(
+                "error",
+                None,
+                ToolError(
+                    "SERVICE_UNAVAILABLE",
+                    "Выполнение прервано сбоем хранилища",
+                ),
+                {},
+            ),
         )
 
     def _defer(self, transition: _PendingTransition) -> None:
@@ -210,8 +235,10 @@ class Dispatcher:
     def _save_transition(self, transition: _PendingTransition) -> None:
         with self._repository.transaction(transition.job_id) as record:
             # Проверка отмены и публикация итога защищены одной транзакцией.
-            if (record.job.state == State.RUNNING
-                    and record.execution_id == transition.execution_id):
+            if (
+                record.job.state == State.RUNNING
+                and record.execution_id == transition.execution_id
+            ):
                 result = transition.result
                 if result is None:
                     record.job.wait_quota()
@@ -230,10 +257,14 @@ class Dispatcher:
     def _internal_error(context: ToolContext) -> ToolResult:
         logger.exception(
             "Ошибка выполнения Job %s, correlation_id=%s",
-            context.job_id, context.correlation_id,
+            context.job_id,
+            context.correlation_id,
         )
         return ToolResult(
-            "error", None, ToolError("INTERNAL_ERROR", "Внутренняя ошибка выполнения"), {},
+            "error",
+            None,
+            ToolError("INTERNAL_ERROR", "Внутренняя ошибка выполнения"),
+            {},
         )
 
     @staticmethod
@@ -251,20 +282,30 @@ class Dispatcher:
         else:
             raise ValueError("Tool вернул неизвестный статус")
 
-    def _snapshot_error(self, record: JobRecord, error: SnapshotError) -> _PendingTransition:
+    def _snapshot_error(
+        self, record: JobRecord, error: SnapshotError
+    ) -> _PendingTransition:
         if error.code != "SOURCE_RATE_LIMITED":
             result = ToolResult("error", None, ToolError(error.code, error.message), {})
             return _PendingTransition(record.job.id, record.execution_id, result)
         delay = 60 if error.retry_after_seconds is None else error.retry_after_seconds
         if not math.isfinite(delay) or delay < 0:
-            result = ToolResult("error", None, ToolError(
-                "SOURCE_BAD_DATA", "Некорректное время ожидания квоты",
-            ), {})
+            result = ToolResult(
+                "error",
+                None,
+                ToolError(
+                    "SOURCE_BAD_DATA",
+                    "Некорректное время ожидания квоты",
+                ),
+                {},
+            )
             return _PendingTransition(record.job.id, record.execution_id, result)
         now = self._clock()
         remaining = self._max_quota_wait - record.quota_wait_seconds
         return _PendingTransition(
-            record.job.id, record.execution_id, quota_started_at=now,
+            record.job.id,
+            record.execution_id,
+            quota_started_at=now,
             retry_at=now + timedelta(seconds=min(delay, remaining)),
         )
 
@@ -282,7 +323,9 @@ class Dispatcher:
                 self._save_transition(transition)
                 processed.add(transition.job_id)
             except StorageError:
-                logger.exception("Не удалось сохранить отложенный переход Job %s", transition.job_id)
+                logger.exception(
+                    "Не удалось сохранить отложенный переход Job %s", transition.job_id
+                )
         for job_id in self._repository.pending_ids():
             try:
                 if self.execute(job_id):
@@ -316,6 +359,8 @@ class Dispatcher:
         for job_id in self._repository.running_ids():
             with self._repository.transaction(job_id) as record:
                 if record.job.state == State.RUNNING:
-                    record.job.fail("WORKER_INTERRUPTED", "Выполнение прервано перезапуском сервера")
+                    record.job.fail(
+                        "WORKER_INTERRUPTED", "Выполнение прервано перезапуском сервера"
+                    )
                     count += 1
         return count
