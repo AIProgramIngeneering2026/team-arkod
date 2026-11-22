@@ -19,7 +19,7 @@ from arkod.application.ports import (
     StorageError,
 )
 from arkod.domain.job import Job, State
-from arkod.domain.tools.models import Tool, ToolContext, ToolError, ToolResult
+from arkod.domain.tool.models import Tool, ToolContext, ToolError, ToolResult
 
 logger = logging.getLogger(__name__)
 
