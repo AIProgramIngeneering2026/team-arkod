@@ -4,20 +4,19 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "Daniil", email = "Alekseev51591@gmail.com" }
+    { name = "Daniil", email = "Alekseev51591@gmail.com" },
+    { name = "Kirill", email = "k.godov@list.ru" }
 ]
 requires-python = ">=3.14"
 dependencies = [
     "pydantic>=2.12,<3",
     "pytest>=9.2.0",
+    "scipy"
 ]
-
-[project.scripts]
-team-arkod = "team_arkod:main"
 
 [build-system]
 requires = ["uv_build>=0.13.9,<0.14.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = ["arkod", "team_arkod"]
+module-name = ["arkod"]
