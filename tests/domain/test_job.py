@@ -50,13 +50,39 @@ def test_quota_expired():
 
 # --- все недопустимые пары отклоняются, состояние не меняется ---
 
+# Ожидаемые переходы заданы здесь, по диаграмме из docs/requirements.md, а не берутся из
+# TRANSITIONS реализации. Иначе лишний переход в Job не заметил бы ни один тест.
+EXPECTED = {
+    ("start", State.CREATED): State.RUNNING,
+    ("wait_quota", State.RUNNING): State.WAITING_QUOTA,
+    ("resume", State.WAITING_QUOTA): State.RUNNING,
+    ("finish", State.RUNNING): State.DONE,
+    ("fail", State.RUNNING): State.FAILED,
+    ("expire_quota", State.WAITING_QUOTA): State.FAILED,
+    ("cancel", State.CREATED): State.CANCELLED,
+    ("cancel", State.RUNNING): State.CANCELLED,
+    ("cancel", State.WAITING_QUOTA): State.CANCELLED,
+    ("recover", State.RUNNING): State.CREATED,
+}
+
 INVALID = [(c, s) for c in ALL_COMMANDS for s in State
-           if (c, s) not in TRANSITIONS and c != "recover"]
+           if (c, s) not in EXPECTED and c != "recover"]
 
 PATH_TO = {
     State.CREATED: [], State.RUNNING: ["start"], State.WAITING_QUOTA: ["start", "wait_quota"],
     State.DONE: ["start", "finish"], State.FAILED: ["start", "fail"], State.CANCELLED: ["cancel"],
 }
+
+
+@pytest.mark.parametrize("cmd,state", sorted(EXPECTED, key=lambda k: (k[0], k[1].value)))
+def test_allowed_transition_works(cmd, state):
+    j = make(*PATH_TO[state])
+    call(j, cmd)
+    assert j.state == EXPECTED[(cmd, state)]
+
+
+def test_transition_table_matches_diagram():
+    assert dict(TRANSITIONS) == EXPECTED
 
 
 @pytest.mark.parametrize("cmd,state", INVALID)
@@ -99,8 +125,18 @@ def test_z2_restart_not_stuck_in_running():
     assert j.state == State.RUNNING and j.active_tools == 1
 
 
+def test_start_recover_start():
+    j = Job(1, "x")
+    j.start()
+    assert j.state == State.RUNNING
+    j.recover()
+    assert j.state == State.CREATED and j.active_tools == 0
+    j.start()  # задачу можно запустить второй раз
+    assert j.state == State.RUNNING and j.active_tools == 1
+
+
 def test_z2_recover_ignored_outside_running():
-    for chain in ([], ["start", "wait_quota"], ["start", "finish"], ["cancel"]):
+    for chain in ([], ["start", "wait_quota"], ["start", "finish"], ["start", "fail"], ["cancel"]):
         j = make(*chain)
         before = j.state
         j.recover()
